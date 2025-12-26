@@ -1,438 +1,772 @@
-// ====================================
-// STOCKFLOW - BACKEND SUPER SIMPLES
-// ====================================
+/**
+ * ====================================================================================
+ * STOCKFLOW - BACKEND API
+ * Sistema de Controle de Estoque Web - v2.1
+ * ====================================================================================
+ */
 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'minha-chave-secreta-123';
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ====================================================================================
+// MIDDLEWARE
+// ====================================================================================
 
-// ====================================
-// BANCO DE DADOS SQLITE (arquivo local)
-// ====================================
-const db = new sqlite3.Database('./estoque.db', (err) => {
-    if (err) {
-        console.error('❌ Erro ao conectar banco:', err);
-    } else {
-        console.log('✅ Banco SQLite conectado!');
-        inicializarBanco();
-    }
+app.use(cors({
+    origin: '*',
+    credentials: true
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// ====================================================================================
+// CONFIGURAÇÃO DO BANCO DE DADOS
+// ====================================================================================
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Criar tabelas
-function inicializarBanco() {
-    db.serialize(() => {
-        // Tabela de usuários
-        db.run(`
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                role TEXT DEFAULT 'funcionario',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
+// ====================================================================================
+// FUNÇÃO AUXILIAR PARA ADICIONAR COLUNA SE NÃO EXISTIR
+// ====================================================================================
 
-        // Tabela de produtos
-        db.run(`
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                barcode TEXT UNIQUE,
-                quantity INTEGER DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        // Tabela de histórico
-        db.run(`
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id INTEGER,
-                product_name TEXT,
-                action TEXT NOT NULL,
-                quantity INTEGER DEFAULT 0,
-                user_id INTEGER,
-                date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (product_id) REFERENCES products(id),
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        `);
-
-        // Criar admin padrão
-        db.get('SELECT * FROM users WHERE email = ?', ['admin@estoque.com'], (err, row) => {
-            if (!row) {
-                const senha = bcrypt.hashSync('admin123', 10);
-                db.run(
-                    'INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)',
-                    ['Administrador', 'admin@estoque.com', senha, 'admin'],
-                    () => {
-                        console.log('👤 Admin criado: admin@estoque.com / admin123');
-                    }
-                );
-            }
-        });
-    });
+async function addColumnIfNotExists(table, column, type) {
+    try {
+        // Verifica se a coluna já existe
+        const checkQuery = `
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = $1 AND column_name = $2
+        `;
+        const result = await pool.query(checkQuery, [table, column]);
+        
+        if (result.rows.length === 0) {
+            // Coluna não existe, adicionar
+            await pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+            console.log(`✅ Coluna ${column} adicionada na tabela ${table}`);
+        } else {
+            console.log(`ℹ️ Coluna ${column} já existe na tabela ${table}`);
+        }
+    } catch (error) {
+        console.error(`❌ Erro ao adicionar coluna ${column}:`, error.message);
+    }
 }
 
-// ====================================
+// ====================================================================================
+// FUNÇÕES DE BANCO DE DADOS
+// ====================================================================================
+
+async function initializeDatabase() {
+    try {
+        // Tabela de usuários
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                role VARCHAR(50) DEFAULT 'funcionario',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('✅ Tabela users OK');
+
+        // Tabela de produtos (estrutura básica)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS products (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                barcode VARCHAR(255) UNIQUE,
+                quantity INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('✅ Tabela products OK');
+
+        // Tabela de histórico (estrutura básica)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS history (
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER,
+                action VARCHAR(50) NOT NULL,
+                quantity INTEGER DEFAULT 0,
+                user_id INTEGER,
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                product_name VARCHAR(255)
+            )
+        `);
+        console.log('✅ Tabela history OK');
+
+        // ✅ ADICIONAR COLUNAS NOVAS NA TABELA PRODUCTS
+        console.log('🔧 Verificando colunas da tabela products...');
+        await addColumnIfNotExists('products', 'category', "VARCHAR(100) DEFAULT 'Higiene'");
+        await addColumnIfNotExists('products', 'unit', "VARCHAR(20) DEFAULT 'un'");
+        await addColumnIfNotExists('products', 'price', 'DECIMAL(10,2) DEFAULT 0');
+        await addColumnIfNotExists('products', 'min_quantity', 'INTEGER DEFAULT 5');
+        await addColumnIfNotExists('products', 'description', 'TEXT');
+
+        // ✅ ADICIONAR COLUNA NOVA NA TABELA HISTORY
+        console.log('🔧 Verificando colunas da tabela history...');
+        await addColumnIfNotExists('history', 'total_value', 'DECIMAL(10,2) DEFAULT 0');
+
+        // Criar usuário admin padrão se não existir
+        const adminEmail = process.env.ADMIN_EMAIL || 'admin@stockflow.com';
+        const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+        
+        const adminExists = await pool.query('SELECT * FROM users WHERE email = $1', [adminEmail]);
+        
+        if (adminExists.rows.length === 0) {
+            const hashedPassword = await bcrypt.hash(adminPassword, 12);
+            await pool.query(
+                'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4)',
+                ['Administrador', adminEmail, hashedPassword, 'admin']
+            );
+            console.log('✅ Usuário admin criado:', adminEmail);
+        }
+
+        console.log('✅ Banco de dados inicializado com sucesso!');
+        
+    } catch (error) {
+        console.error('❌ Erro ao inicializar banco de dados:', error);
+        process.exit(1);
+    }
+}
+
+// ====================================================================================
 // MIDDLEWARE DE AUTENTICAÇÃO
-// ====================================
-function autenticar(req, res, next) {
-    const token = req.headers['authorization']?.split(' ')[1];
-    
+// ====================================================================================
+
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
     if (!token) {
         return res.status(401).json({ error: 'Token não fornecido' });
     }
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
+    jwt.verify(token, process.env.JWT_SECRET || 'sua-chave-secreta-super-segura', (err, user) => {
         if (err) {
-            return res.status(403).json({ error: 'Token inválido' });
+            return res.status(403).json({ error: 'Token inválido ou expirado' });
         }
         req.user = user;
         next();
     });
 }
 
-// ====================================
-// ROTAS DE AUTENTICAÇÃO
-// ====================================
-
-// Registrar usuário
-app.post('/auth/register', (req, res) => {
-    const { name, email, password, role = 'funcionario' } = req.body;
-
-    if (!name || !email || !password) {
-        return res.status(400).json({ error: 'Preencha todos os campos' });
+function requireAdmin(req, res, next) {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Acesso negado. Requer perfil administrador.' });
     }
+    next();
+}
 
-    const senhaHash = bcrypt.hashSync(password, 10);
+// ====================================================================================
+// ROTAS DE AUTENTICAÇÃO
+// ====================================================================================
 
-    db.run(
-        'INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)',
-        [name, email, senhaHash, role],
-        function(err) {
-            if (err) {
-                return res.status(400).json({ error: 'Email já cadastrado' });
-            }
+app.post('/auth/register', async (req, res) => {
+    try {
+        const { name, email, password, role = 'funcionario' } = req.body;
 
-            const token = jwt.sign({ id: this.lastID, email, role }, JWT_SECRET, { expiresIn: '7d' });
-
-            res.status(201).json({
-                token,
-                user: { id: this.lastID, name, email, role }
-            });
+        if (!name || !email || !password) {
+            return res.status(400).json({ error: 'Nome, email e senha são obrigatórios' });
         }
-    );
+
+        if (password.length < 6) {
+            return res.status(400).json({ error: 'Senha deve ter pelo menos 6 caracteres' });
+        }
+
+        const userExists = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        
+        if (userExists.rows.length > 0) {
+            return res.status(400).json({ error: 'Email já cadastrado' });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 12);
+
+        const result = await pool.query(
+            'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email, role, created_at',
+            [name, email, hashedPassword, role]
+        );
+
+        const user = result.rows[0];
+
+        const token = jwt.sign(
+            { id: user.id, email: user.email, role: user.role },
+            process.env.JWT_SECRET || 'sua-chave-secreta-super-segura',
+            { expiresIn: '7d' }
+        );
+
+        res.status(201).json({
+            message: 'Usuário criado com sucesso',
+            token,
+            user: { id: user.id, name: user.name, email: user.email, role: user.role }
+        });
+
+    } catch (error) {
+        console.error('Erro no registro:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
 });
 
-// Login
-app.post('/auth/login', (req, res) => {
-    const { email, password } = req.body;
+app.post('/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
 
-    db.get('SELECT * FROM users WHERE email = ?', [email], (err, user) => {
-        if (!user) {
-            return res.status(401).json({ error: 'Email ou senha inválidos' });
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email e senha são obrigatórios' });
         }
 
-        if (!bcrypt.compareSync(password, user.password)) {
-            return res.status(401).json({ error: 'Email ou senha inválidos' });
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Credenciais inválidas' });
+        }
+
+        const user = result.rows[0];
+
+        const isValidPassword = await bcrypt.compare(password, user.password);
+        
+        if (!isValidPassword) {
+            return res.status(401).json({ error: 'Credenciais inválidas' });
         }
 
         const token = jwt.sign(
             { id: user.id, email: user.email, role: user.role },
-            JWT_SECRET,
+            process.env.JWT_SECRET || 'sua-chave-secreta-super-segura',
             { expiresIn: '7d' }
         );
 
         res.json({
+            message: 'Login realizado com sucesso',
             token,
-            user: {
-                id: user.id,
-                name: user.name,
-                email: user.email,
-                role: user.role
-            }
+            user: { id: user.id, name: user.name, email: user.email, role: user.role }
         });
-    });
+
+    } catch (error) {
+        console.error('Erro no login:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
 });
 
-// ====================================
+// ====================================================================================
 // ROTAS DE PRODUTOS
-// ====================================
+// ====================================================================================
 
-// Listar produtos
-app.get('/products', autenticar, (req, res) => {
-    const { search, barcode } = req.query;
-    let query = 'SELECT * FROM products';
-    let params = [];
+/**
+ * GET /products - Listar todos os produtos
+ */
+app.get('/products', authenticateToken, async (req, res) => {
+    try {
+        const { search, barcode, category } = req.query;
+        let query = 'SELECT * FROM products';
+        let params = [];
+        let conditions = [];
 
-    if (search) {
-        query += ' WHERE name LIKE ?';
-        params.push(`%${search}%`);
-    } else if (barcode) {
-        query += ' WHERE barcode = ?';
-        params.push(barcode);
-    }
-
-    query += ' ORDER BY name';
-
-    db.all(query, params, (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: 'Erro ao buscar produtos' });
+        if (search) {
+            conditions.push(`LOWER(name) LIKE LOWER($${params.length + 1})`);
+            params.push(`%${search}%`);
         }
-        res.json(rows);
-    });
+        
+        if (barcode) {
+            conditions.push(`barcode = $${params.length + 1}`);
+            params.push(barcode);
+        }
+
+        if (category && category !== 'Todos') {
+            conditions.push(`category = $${params.length + 1}`);
+            params.push(category);
+        }
+
+        if (conditions.length > 0) {
+            query += ' WHERE ' + conditions.join(' AND ');
+        }
+
+        query += ' ORDER BY name ASC';
+
+        const result = await pool.query(query, params);
+        
+        // Garantir que os valores numéricos estão corretos
+        const products = result.rows.map(p => ({
+            ...p,
+            quantity: parseInt(p.quantity) || 0,
+            price: parseFloat(p.price) || 0,
+            min_quantity: parseInt(p.min_quantity) || 5
+        }));
+        
+        res.json(products);
+
+    } catch (error) {
+        console.error('Erro ao listar produtos:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
 });
 
-// Criar produto
-app.post('/products', autenticar, (req, res) => {
-    const { name, barcode, quantity = 0 } = req.body;
+/**
+ * GET /products/:id - Buscar produto por ID
+ */
+app.get('/products/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Produto não encontrado' });
+        }
+        
+        const p = result.rows[0];
+        res.json({
+            ...p,
+            quantity: parseInt(p.quantity) || 0,
+            price: parseFloat(p.price) || 0,
+            min_quantity: parseInt(p.min_quantity) || 5
+        });
 
-    if (!name) {
-        return res.status(400).json({ error: 'Nome é obrigatório' });
+    } catch (error) {
+        console.error('Erro ao buscar produto:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
     }
+});
 
-    db.run(
-        'INSERT INTO products (name, barcode, quantity) VALUES (?, ?, ?)',
-        [name, barcode, quantity],
-        function(err) {
-            if (err) {
+/**
+ * POST /products - Criar novo produto
+ */
+app.post('/products', authenticateToken, async (req, res) => {
+    try {
+        const { 
+            name, 
+            barcode, 
+            category = 'Higiene', 
+            quantity = 0, 
+            unit = 'un', 
+            price = 0, 
+            min_quantity = 5, 
+            description = '' 
+        } = req.body;
+
+        console.log('📦 Criando produto:', { name, barcode, category, quantity, unit, price, min_quantity });
+
+        if (!name) {
+            return res.status(400).json({ error: 'Nome do produto é obrigatório' });
+        }
+
+        // Verificar código de barras duplicado
+        if (barcode) {
+            const barcodeExists = await pool.query('SELECT * FROM products WHERE barcode = $1', [barcode]);
+            if (barcodeExists.rows.length > 0) {
                 return res.status(400).json({ error: 'Código de barras já cadastrado' });
             }
-
-            const productId = this.lastID;
-
-            // Registrar no histórico
-            if (quantity > 0) {
-                db.run(
-                    'INSERT INTO history (product_id, product_name, action, quantity, user_id) VALUES (?, ?, ?, ?, ?)',
-                    [productId, name, 'cadastro', quantity, req.user.id]
-                );
-            }
-
-            res.status(201).json({
-                id: productId,
-                name,
-                barcode,
-                quantity
-            });
-        }
-    );
-});
-
-// Atualizar produto
-app.put('/products/:id', autenticar, (req, res) => {
-    const { id } = req.params;
-    const { name, barcode, quantity } = req.body;
-
-    db.run(
-        'UPDATE products SET name = ?, barcode = ?, quantity = ? WHERE id = ?',
-        [name, barcode, quantity, id],
-        function(err) {
-            if (err) {
-                return res.status(400).json({ error: 'Erro ao atualizar' });
-            }
-
-            // Registrar no histórico
-            db.run(
-                'INSERT INTO history (product_id, product_name, action, quantity, user_id) VALUES (?, ?, ?, ?, ?)',
-                [id, name, 'edicao', quantity, req.user.id]
-            );
-
-            res.json({ id, name, barcode, quantity });
-        }
-    );
-});
-
-// Deletar produto
-app.delete('/products/:id', autenticar, (req, res) => {
-    const { id } = req.params;
-
-    db.get('SELECT name FROM products WHERE id = ?', [id], (err, product) => {
-        if (!product) {
-            return res.status(404).json({ error: 'Produto não encontrado' });
         }
 
-        // Registrar exclusão
-        db.run(
-            'INSERT INTO history (product_id, product_name, action, quantity, user_id) VALUES (?, ?, ?, ?, ?)',
-            [id, product.name, 'exclusao', 0, req.user.id]
+        // Converter valores para garantir tipos corretos
+        const qty = parseInt(quantity) || 0;
+        const prc = parseFloat(price) || 0;
+        const minQty = parseInt(min_quantity) || 5;
+
+        const result = await pool.query(
+            `INSERT INTO products (name, barcode, category, quantity, unit, price, min_quantity, description) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [name, barcode || null, category, qty, unit, prc, minQty, description || '']
         );
 
-        db.run('DELETE FROM products WHERE id = ?', [id], (err) => {
-            if (err) {
-                return res.status(500).json({ error: 'Erro ao excluir' });
-            }
-            res.json({ message: 'Produto excluído' });
+        const product = result.rows[0];
+        console.log('✅ Produto criado:', product);
+
+        // Registrar no histórico
+        const totalValue = qty * prc;
+        await pool.query(
+            'INSERT INTO history (product_id, action, quantity, user_id, product_name, total_value) VALUES ($1, $2, $3, $4, $5, $6)',
+            [product.id, 'cadastro', qty, req.user.id, name, totalValue]
+        );
+
+        res.status(201).json({
+            ...product,
+            quantity: parseInt(product.quantity) || 0,
+            price: parseFloat(product.price) || 0,
+            min_quantity: parseInt(product.min_quantity) || 5
         });
-    });
+
+    } catch (error) {
+        console.error('❌ Erro ao criar produto:', error);
+        res.status(500).json({ error: 'Erro interno do servidor: ' + error.message });
+    }
 });
 
-// Aumentar estoque (entrada)
-app.put('/products/:id/increase', autenticar, (req, res) => {
-    const { id } = req.params;
-    const { quantity } = req.body;
+/**
+ * PUT /products/:id - Atualizar produto
+ */
+app.put('/products/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { 
+            name, 
+            barcode, 
+            category = 'Higiene', 
+            quantity = 0, 
+            unit = 'un', 
+            price = 0, 
+            min_quantity = 5, 
+            description = '' 
+        } = req.body;
 
-    db.get('SELECT * FROM products WHERE id = ?', [id], (err, product) => {
-        if (!product) {
+        console.log('📝 Atualizando produto:', id, { name, barcode, category, quantity, unit, price, min_quantity });
+
+        if (!name) {
+            return res.status(400).json({ error: 'Nome do produto é obrigatório' });
+        }
+
+        const productExists = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+        if (productExists.rows.length === 0) {
             return res.status(404).json({ error: 'Produto não encontrado' });
         }
 
-        const novaQuantidade = product.quantity + quantity;
-
-        db.run(
-            'UPDATE products SET quantity = ? WHERE id = ?',
-            [novaQuantidade, id],
-            () => {
-                // Registrar no histórico
-                db.run(
-                    'INSERT INTO history (product_id, product_name, action, quantity, user_id) VALUES (?, ?, ?, ?, ?)',
-                    [id, product.name, 'entrada', quantity, req.user.id]
-                );
-
-                res.json({ ...product, quantity: novaQuantidade });
+        // Verificar código de barras duplicado (excluindo o produto atual)
+        if (barcode) {
+            const barcodeExists = await pool.query(
+                'SELECT * FROM products WHERE barcode = $1 AND id != $2',
+                [barcode, id]
+            );
+            if (barcodeExists.rows.length > 0) {
+                return res.status(400).json({ error: 'Código de barras já cadastrado' });
             }
+        }
+
+        // Converter valores
+        const qty = parseInt(quantity) || 0;
+        const prc = parseFloat(price) || 0;
+        const minQty = parseInt(min_quantity) || 5;
+
+        const result = await pool.query(
+            `UPDATE products SET 
+                name = $1, 
+                barcode = $2, 
+                category = $3, 
+                quantity = $4, 
+                unit = $5, 
+                price = $6, 
+                min_quantity = $7, 
+                description = $8,
+                updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $9 RETURNING *`,
+            [name, barcode || null, category, qty, unit, prc, minQty, description || '', id]
         );
-    });
+
+        const product = result.rows[0];
+        console.log('✅ Produto atualizado:', product);
+
+        // Registrar no histórico
+        const totalValue = qty * prc;
+        await pool.query(
+            'INSERT INTO history (product_id, action, quantity, user_id, product_name, total_value) VALUES ($1, $2, $3, $4, $5, $6)',
+            [product.id, 'edicao', qty, req.user.id, name, totalValue]
+        );
+
+        res.json({
+            ...product,
+            quantity: parseInt(product.quantity) || 0,
+            price: parseFloat(product.price) || 0,
+            min_quantity: parseInt(product.min_quantity) || 5
+        });
+
+    } catch (error) {
+        console.error('❌ Erro ao atualizar produto:', error);
+        res.status(500).json({ error: 'Erro interno do servidor: ' + error.message });
+    }
 });
 
-// Diminuir estoque (saída)
-app.put('/products/:id/decrease', autenticar, (req, res) => {
-    const { id } = req.params;
-    const { quantity } = req.body;
+/**
+ * DELETE /products/:id - Excluir produto
+ */
+app.delete('/products/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
 
-    db.get('SELECT * FROM products WHERE id = ?', [id], (err, product) => {
-        if (!product) {
+        const product = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+        if (product.rows.length === 0) {
             return res.status(404).json({ error: 'Produto não encontrado' });
         }
 
-        if (product.quantity < quantity) {
+        // Registrar no histórico antes de excluir
+        await pool.query(
+            'INSERT INTO history (product_id, action, quantity, user_id, product_name, total_value) VALUES ($1, $2, $3, $4, $5, $6)',
+            [id, 'exclusao', 0, req.user.id, product.rows[0].name, 0]
+        );
+
+        await pool.query('DELETE FROM products WHERE id = $1', [id]);
+
+        res.json({ message: 'Produto excluído com sucesso' });
+
+    } catch (error) {
+        console.error('Erro ao excluir produto:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
+});
+
+// ====================================================================================
+// ROTAS DE MOVIMENTAÇÃO DE ESTOQUE
+// ====================================================================================
+
+/**
+ * PUT /products/:id/increase - Entrada de estoque
+ */
+app.put('/products/:id/increase', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { quantity } = req.body;
+
+        const qty = parseInt(quantity);
+        if (!qty || qty <= 0) {
+            return res.status(400).json({ error: 'Quantidade inválida' });
+        }
+
+        const product = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+        if (product.rows.length === 0) {
+            return res.status(404).json({ error: 'Produto não encontrado' });
+        }
+
+        const result = await pool.query(
+            'UPDATE products SET quantity = quantity + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *',
+            [qty, id]
+        );
+
+        const updatedProduct = result.rows[0];
+        
+        const price = parseFloat(product.rows[0].price) || 0;
+        const totalValue = qty * price;
+
+        await pool.query(
+            'INSERT INTO history (product_id, action, quantity, user_id, product_name, total_value) VALUES ($1, $2, $3, $4, $5, $6)',
+            [id, 'entrada', qty, req.user.id, product.rows[0].name, totalValue]
+        );
+
+        res.json({
+            ...updatedProduct,
+            quantity: parseInt(updatedProduct.quantity) || 0,
+            price: parseFloat(updatedProduct.price) || 0
+        });
+
+    } catch (error) {
+        console.error('Erro ao aumentar estoque:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
+});
+
+/**
+ * PUT /products/:id/decrease - Saída de estoque
+ */
+app.put('/products/:id/decrease', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { quantity } = req.body;
+
+        const qty = parseInt(quantity);
+        if (!qty || qty <= 0) {
+            return res.status(400).json({ error: 'Quantidade inválida' });
+        }
+
+        const product = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+        if (product.rows.length === 0) {
+            return res.status(404).json({ error: 'Produto não encontrado' });
+        }
+
+        const currentQty = parseInt(product.rows[0].quantity) || 0;
+        if (currentQty < qty) {
             return res.status(400).json({ error: 'Estoque insuficiente' });
         }
 
-        const novaQuantidade = product.quantity - quantity;
-
-        db.run(
-            'UPDATE products SET quantity = ? WHERE id = ?',
-            [novaQuantidade, id],
-            () => {
-                // Registrar no histórico
-                db.run(
-                    'INSERT INTO history (product_id, product_name, action, quantity, user_id) VALUES (?, ?, ?, ?, ?)',
-                    [id, product.name, 'saida', quantity, req.user.id]
-                );
-
-                res.json({ ...product, quantity: novaQuantidade });
-            }
+        const result = await pool.query(
+            'UPDATE products SET quantity = quantity - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *',
+            [qty, id]
         );
-    });
-});
 
-// ====================================
-// ROTAS DE HISTÓRICO
-// ====================================
+        const updatedProduct = result.rows[0];
 
-app.get('/history', autenticar, (req, res) => {
-    const { date, action } = req.query;
-    let query = `
-        SELECT h.*, u.name as user_name 
-        FROM history h 
-        LEFT JOIN users u ON h.user_id = u.id
-        WHERE 1=1
-    `;
-    let params = [];
+        const price = parseFloat(product.rows[0].price) || 0;
+        const totalValue = qty * price;
 
-    if (date) {
-        query += ' AND DATE(h.date) = ?';
-        params.push(date);
-    }
+        await pool.query(
+            'INSERT INTO history (product_id, action, quantity, user_id, product_name, total_value) VALUES ($1, $2, $3, $4, $5, $6)',
+            [id, 'saida', qty, req.user.id, product.rows[0].name, totalValue]
+        );
 
-    if (action) {
-        query += ' AND h.action = ?';
-        params.push(action);
-    }
-
-    query += ' ORDER BY h.date DESC';
-
-    db.all(query, params, (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: 'Erro ao buscar histórico' });
-        }
-        res.json(rows);
-    });
-});
-
-// ====================================
-// DASHBOARD
-// ====================================
-
-app.get('/dashboard', autenticar, (req, res) => {
-    db.get('SELECT COUNT(*) as count FROM products', (err, total) => {
-        db.get('SELECT COUNT(*) as count FROM products WHERE quantity < 10', (err, baixo) => {
-            db.get('SELECT COUNT(*) as count FROM history WHERE action = "entrada" AND DATE(date) = DATE("now")', (err, entradas) => {
-                db.get('SELECT COUNT(*) as count FROM history WHERE action = "saida" AND DATE(date) = DATE("now")', (err, saidas) => {
-                    res.json({
-                        totalProducts: total.count,
-                        lowStock: baixo.count,
-                        entriesToday: entradas.count,
-                        exitsToday: saidas.count
-                    });
-                });
-            });
+        res.json({
+            ...updatedProduct,
+            quantity: parseInt(updatedProduct.quantity) || 0,
+            price: parseFloat(updatedProduct.price) || 0
         });
-    });
-});
 
-// ====================================
-// USUÁRIOS (ADMIN)
-// ====================================
-
-app.get('/users', autenticar, (req, res) => {
-    if (req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Acesso negado' });
+    } catch (error) {
+        console.error('Erro ao diminuir estoque:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
     }
-
-    db.all('SELECT id, name, email, role, created_at FROM users', (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: 'Erro ao buscar usuários' });
-        }
-        res.json(rows);
-    });
 });
 
-// ====================================
-// ROTA RAIZ
-// ====================================
+// ====================================================================================
+// ROTAS DE HISTÓRICO
+// ====================================================================================
+
+app.get('/history', authenticateToken, async (req, res) => {
+    try {
+        const { date, action } = req.query;
+        let query = `
+            SELECT h.*, u.name as user_name 
+            FROM history h 
+            LEFT JOIN users u ON h.user_id = u.id
+        `;
+        let params = [];
+        let conditions = [];
+
+        if (date) {
+            conditions.push(`DATE(h.date) = $${params.length + 1}`);
+            params.push(date);
+        }
+
+        if (action) {
+            conditions.push(`h.action = $${params.length + 1}`);
+            params.push(action);
+        }
+
+        if (conditions.length > 0) {
+            query += ' WHERE ' + conditions.join(' AND ');
+        }
+
+        query += ' ORDER BY h.date DESC LIMIT 100';
+
+        const result = await pool.query(query, params);
+        
+        const formattedHistory = result.rows.map(h => ({
+            ...h,
+            created_at: h.date,
+            type: h.action,
+            total_value: parseFloat(h.total_value) || 0
+        }));
+        
+        res.json(formattedHistory);
+
+    } catch (error) {
+        console.error('Erro ao listar histórico:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
+});
+
+// ====================================================================================
+// ROTAS DE DASHBOARD
+// ====================================================================================
+
+app.get('/dashboard', authenticateToken, async (req, res) => {
+    try {
+        const totalProducts = await pool.query('SELECT COUNT(*) as count FROM products');
+        const lowStock = await pool.query('SELECT COUNT(*) as count FROM products WHERE quantity <= COALESCE(min_quantity, 5)');
+        const totalValue = await pool.query('SELECT COALESCE(SUM(quantity * price), 0) as total FROM products');
+        const totalItems = await pool.query('SELECT COALESCE(SUM(quantity), 0) as total FROM products');
+
+        const entriesToday = await pool.query(`
+            SELECT COUNT(*) as count 
+            FROM history 
+            WHERE action = 'entrada' AND DATE(date) = CURRENT_DATE
+        `);
+
+        const exitsToday = await pool.query(`
+            SELECT COUNT(*) as count 
+            FROM history 
+            WHERE action = 'saida' AND DATE(date) = CURRENT_DATE
+        `);
+
+        res.json({
+            totalProducts: parseInt(totalProducts.rows[0].count) || 0,
+            lowStock: parseInt(lowStock.rows[0].count) || 0,
+            totalValue: parseFloat(totalValue.rows[0].total) || 0,
+            totalItems: parseInt(totalItems.rows[0].total) || 0,
+            entriesToday: parseInt(entriesToday.rows[0].count) || 0,
+            exitsToday: parseInt(exitsToday.rows[0].count) || 0
+        });
+
+    } catch (error) {
+        console.error('Erro ao carregar dashboard:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
+});
+
+// ====================================================================================
+// ROTAS DE USUÁRIOS (ADMIN)
+// ====================================================================================
+
+app.get('/users', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT id, name, email, role, created_at FROM users ORDER BY name ASC'
+        );
+        res.json(result.rows);
+
+    } catch (error) {
+        console.error('Erro ao listar usuários:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
+});
+
+app.delete('/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (parseInt(id) === req.user.id) {
+            return res.status(400).json({ error: 'Não é possível excluir seu próprio usuário' });
+        }
+
+        const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING *', [id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuário não encontrado' });
+        }
+
+        res.json({ message: 'Usuário excluído com sucesso' });
+
+    } catch (error) {
+        console.error('Erro ao excluir usuário:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
+    }
+});
+
+// ====================================================================================
+// ROTA PRINCIPAL
+// ====================================================================================
 
 app.get('/', (req, res) => {
     res.json({
-        message: 'StockFlow API - Rodando!',
-        version: '1.0.0',
-        endpoints: {
-            auth: ['/auth/login', '/auth/register'],
-            products: ['/products', '/products/:id/increase', '/products/:id/decrease'],
-            history: ['/history'],
-            dashboard: ['/dashboard']
-        }
+        message: 'StockFlow API',
+        version: '2.1.0',
+        status: 'online',
+        timestamp: new Date().toISOString()
     });
 });
 
-// ====================================
-// INICIAR SERVIDOR
-// ====================================
+// ====================================================================================
+// INICIALIZAÇÃO DO SERVIDOR
+// ====================================================================================
 
-app.listen(PORT, () => {
-    console.log('🚀 Servidor rodando em http://localhost:' + PORT);
-    console.log('👤 Login: admin@estoque.com / admin123');
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, async () => {
+    console.log('🚀 StockFlow API v2.1 iniciando...');
+    console.log(`📡 Porta: ${PORT}`);
+    console.log(`🌍 Ambiente: ${process.env.NODE_ENV || 'development'}`);
+    
+    try {
+        await initializeDatabase();
+        console.log(`✅ Servidor rodando em http://localhost:${PORT}`);
+    } catch (error) {
+        console.error('❌ Erro fatal ao iniciar servidor:', error);
+        process.exit(1);
+    }
 });
+
+module.exports = app;
